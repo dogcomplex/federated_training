@@ -19,6 +19,7 @@ import multiprocessing
 from functools import partial
 import numpy as np
 import random
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -33,8 +34,8 @@ class MNISTNet(nn.Module):
         super(MNISTNet, self).__init__()
         self.conv1 = nn.Conv2d(1, 32, 3, 1)
         self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout(0.25)  # Changed from Dropout2d to Dropout
-        self.dropout2 = nn.Dropout(0.5)   # Changed from Dropout2d to Dropout
+        self.dropout1 = nn.Dropout(0.25)
+        self.dropout2 = nn.Dropout(0.5)
         self.fc1 = nn.Linear(9216, 128)
         self.fc2 = nn.Linear(128, 10)
 
@@ -223,7 +224,24 @@ def run_client_training(model, local_data, optimizer, epochs, device, client_id)
     
     return model.state_dict(), ClientStats(client_id, training_time, network_delay)
 
+def save_cache(data, filename):
+    with open(filename, 'wb') as f:
+        pickle.dump(data, f)
+
+def load_cache(filename):
+    if os.path.exists(filename):
+        with open(filename, 'rb') as f:
+            return pickle.load(f)
+    return None
+
 async def federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device):
+    cache_file = f'federated_cache_{num_clients}_{num_rounds}_{local_epochs}.pkl'
+    cached_data = load_cache(cache_file)
+    
+    if cached_data:
+        print("Loading federated learning results from cache...")
+        return cached_data
+
     client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
     global_model = MNISTNet().to(device)
     clients = [FederatedClient(MNISTNet().to(device), client_data) for client_data in client_datasets]
@@ -231,9 +249,8 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
     early_stopping = EarlyStopping(patience=5)
     all_round_stats: List[RoundStats] = []
     
-    for round in range(num_rounds):
+    for round in tqdm(range(num_rounds), desc="Federated Learning Rounds"):
         round_start_time = time.time()
-        print(f"\nStarting Federated Learning Round {round+1}/{num_rounds}")
         
         # Simulate parallel training
         with multiprocessing.Pool(processes=num_clients) as pool:
@@ -258,8 +275,6 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
         
         round_end_time = time.time()
         round_time = round_end_time - round_start_time
-        print(f"Round {round+1}/{num_rounds} completed")
-        print(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Total Round Time: {round_time:.2f}s")
         
         # Store round statistics
         round_stats = RoundStats(round + 1, list(client_stats), round_time)
@@ -270,17 +285,22 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
             print("Early stopping triggered")
             break
     
-    return global_model, accuracy, f1, conf_matrix, all_round_stats
+    results = (global_model, accuracy, f1, conf_matrix, all_round_stats)
+    save_cache(results, cache_file)
+    return results
 
 async def centralized_learning_simulation(model, train_loader, test_loader, device, num_epochs):
+    cache_file = f'centralized_cache_{num_epochs}.pkl'
+    cached_data = load_cache(cache_file)
+    
+    if cached_data:
+        print("Loading centralized learning results from cache...")
+        return cached_data
+
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     early_stopping = EarlyStopping(patience=5)
     
-    print("\nStarting Centralized Learning")
-    
-    for epoch in range(num_epochs):
-        start_time = time.time()
-        
+    for epoch in tqdm(range(num_epochs), desc="Centralized Learning Epochs"):
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -292,16 +312,14 @@ async def centralized_learning_simulation(model, train_loader, test_loader, devi
         
         accuracy, f1, conf_matrix = evaluate_model(model, test_loader, device)
         
-        end_time = time.time()
-        print(f"Epoch {epoch+1}/{num_epochs} completed")
-        print(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Time: {end_time - start_time:.2f}s")
-        
         early_stopping(1 - accuracy)  # Using accuracy as the metric to monitor
         if early_stopping.early_stop:
             print("Early stopping triggered")
             break
     
-    return model, accuracy, f1, conf_matrix
+    results = (model, accuracy, f1, conf_matrix)
+    save_cache(results, cache_file)
+    return results
 
 @asynccontextmanager
 async def graceful_shutdown(client):
@@ -362,33 +380,39 @@ async def main():
         cent_model = MNISTNet().to(device)
         cent_start_time = time.time()
         cent_model, cent_accuracy, cent_f1, cent_conf_matrix = await centralized_learning_simulation(
-            cent_model, train_loader, test_loader, device, num_epochs=50
+            cent_model, train_loader, test_loader, device, num_epochs=5
         )
         cent_end_time = time.time()
 
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user.")
+    finally:
         print("\nFinal Results:")
-        print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}, Time: {fed_end_time - fed_start_time:.2f}s")
+        if 'fed_accuracy' in locals():
+            print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}, Time: {fed_end_time - fed_start_time:.2f}s")
+        else:
+            print("Federated Learning - Incomplete")
+        
         if 'cent_accuracy' in locals():
             print(f"Centralized Learning - Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}, Time: {cent_end_time - cent_start_time:.2f}s")
         else:
             print("Centralized Learning - Incomplete")
 
-        print("\nConfusion Matrices:")
-        print("Federated Learning:")
-        print(f"{fed_conf_matrix}")
-        print("Centralized Learning:")
-        print(f"{cent_conf_matrix}")
-        
-        print("\nRound Statistics:")
-        for round_stat in round_stats:
-            print(f"Round {round_stat.round_number}:")
-            print(f"  Total Round Time: {round_stat.total_round_time:.2f}s")
-            for client_stat in round_stat.client_stats:
-                print(f"  Client {client_stat.client_id}: Training Time: {client_stat.training_time:.2f}s, Network Delay: {client_stat.network_delay:.2f}s")
-            print()
+        if 'fed_conf_matrix' in locals() and 'cent_conf_matrix' in locals():
+            print("\nConfusion Matrices:")
+            print("Federated Learning:")
+            print(fed_conf_matrix)
+            print("\nCentralized Learning:")
+            print(cent_conf_matrix)
 
-    except KeyboardInterrupt:
-        print("\nSimulation interrupted by user.")
+        if 'round_stats' in locals():
+            print("\nRound Statistics:")
+            for round_stat in round_stats:
+                print(f"Round {round_stat.round_number}:")
+                print(f"  Total Round Time: {round_stat.total_round_time:.2f}s")
+                for client_stat in round_stat.client_stats:
+                    print(f"  Client {client_stat.client_id}: Training Time: {client_stat.training_time:.2f}s, Network Delay: {client_stat.network_delay:.2f}s")
+                print()
 
 if __name__ == '__main__':
     asyncio.run(main())
