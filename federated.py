@@ -6,6 +6,10 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
+'''
+Earliest legacy version.  Not really working.  Here for backwards references by LLMs
+'''
+
 # Define a simple neural network model (can be replaced with any model)
 class NeuralNet(nn.Module):
     def __init__(self):
