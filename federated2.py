@@ -121,6 +121,13 @@ class DataManager:
                 client_subsets[i].extend(split)
         return [torch.utils.data.Subset(dataset, indices) for indices in client_subsets]
 
+    @staticmethod
+    def get_iid_subsets(dataset, num_clients):
+        num_items = len(dataset)
+        indices = list(range(num_items))
+        random.shuffle(indices)
+        return [torch.utils.data.Subset(dataset, indices[i::num_clients]) for i in range(num_clients)]
+
 class CommunicationManager:
     def __init__(self):
         self.ssl_context = ssl.create_default_context(ssl.Purpose.CLIENT_AUTH)
@@ -245,15 +252,19 @@ def load_cache(filename):
             return pickle.load(f)
     return None
 
-async def federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device):
-    cache_file = f'federated_cache_{num_clients}_{num_rounds}_{local_epochs}.pkl'
+async def federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device, iid=False):
+    cache_file = f'federated_cache_{"iid" if iid else "non_iid"}_{num_clients}_{num_rounds}_{local_epochs}.pkl'
     cached_data = load_cache(cache_file)
     
     if cached_data:
-        print("Loading federated learning results from cache...")
+        print(f"Loading {'IID' if iid else 'non-IID'} federated learning results from cache...")
         return cached_data
 
-    client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
+    if iid:
+        client_datasets = DataManager.get_iid_subsets(train_dataset, num_clients)
+    else:
+        client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
+    
     global_model = MNISTNet().to(device)
     clients = [FederatedClient(MNISTNet().to(device), client_data) for client_data in client_datasets]
     
@@ -400,12 +411,19 @@ async def main():
     local_epochs = 5
     
     try:
-        print("Starting Federated Learning Simulation...")
+        print("Starting Non-IID Federated Learning Simulation...")
         fed_start_time = time.time()
         fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats, max_round_times, total_round_times = await federated_learning_simulation(
-            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device
+            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=False
         )
         fed_end_time = time.time()
+
+        print("\nStarting IID Federated Learning Simulation...")
+        iid_fed_start_time = time.time()
+        iid_fed_model, iid_fed_accuracy, iid_fed_f1, iid_fed_conf_matrix, iid_round_stats, iid_max_round_times, iid_total_round_times = await federated_learning_simulation(
+            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=True
+        )
+        iid_fed_end_time = time.time()
 
         print("\nStarting Centralized Learning Simulation...")
         cent_model = MNISTNet().to(device)
@@ -420,24 +438,37 @@ async def main():
     finally:
         print("\nFinal Results:")
         if 'fed_accuracy' in locals():
-            print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}")
+            print("Non-IID Federated Learning:")
+            print(f"  Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}")
             print(f"  Total Time: {fed_end_time - fed_start_time:.2f}s")
             print(f"  Max Path Time: {sum(max_round_times):.2f}s")
             print(f"  Sum Total Time: {sum(total_round_times):.2f}s")
         else:
-            print("Federated Learning - Incomplete")
+            print("Non-IID Federated Learning - Incomplete")
+
+        if 'iid_fed_accuracy' in locals():
+            print("\nIID Federated Learning:")
+            print(f"  Accuracy: {iid_fed_accuracy:.4f}, F1: {iid_fed_f1:.4f}")
+            print(f"  Total Time: {iid_fed_end_time - iid_fed_start_time:.2f}s")
+            print(f"  Max Path Time: {sum(iid_max_round_times):.2f}s")
+            print(f"  Sum Total Time: {sum(iid_total_round_times):.2f}s")
+        else:
+            print("IID Federated Learning - Incomplete")
         
         if 'cent_accuracy' in locals():
-            print(f"Centralized Learning - Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}")
+            print("\nCentralized Learning:")
+            print(f"  Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}")
             print(f"  Total Time: {cent_end_time - cent_start_time:.2f}s")
             print(f"  Actual Training Time: {cent_total_time:.2f}s")
         else:
             print("Centralized Learning - Incomplete")
 
-        if 'fed_conf_matrix' in locals() and 'cent_conf_matrix' in locals():
+        if 'fed_conf_matrix' in locals() and 'iid_fed_conf_matrix' in locals() and 'cent_conf_matrix' in locals():
             print("\nConfusion Matrices:")
-            print("Federated Learning:")
+            print("Non-IID Federated Learning:")
             print(fed_conf_matrix)
+            print("\nIID Federated Learning:")
+            print(iid_fed_conf_matrix)
             print("\nCentralized Learning:")
             print(cent_conf_matrix)
 
