@@ -23,6 +23,7 @@ from tqdm import tqdm
 import psutil
 from collections import deque
 import copy
+from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -464,22 +465,25 @@ class AdaptiveAggregator:
         self.performance_history = self.performance_history[-self.adaptation_interval:]
 
 class AsyncFederatedClient:
-    def __init__(self, model, local_data, aggregator, device):
+    def __init__(self, client_id, model, local_data, aggregator, device):
+        self.client_id = client_id
         self.model = model.to(device)
         self.local_data = DataManager.get_data_loader(local_data)
         self.aggregator = aggregator
         self.device = device
         self.optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+        self.total_time = 0
 
     async def train_and_update(self, num_rounds, local_epochs):
         for round in range(num_rounds):
+            round_start_time = time.time()
             try:
                 # Local training
-                performance = await self.train_locally(local_epochs)
+                performance = await self.train_locally(local_epochs, round, num_rounds)
                 
                 # Send update to aggregator
                 model_diff = self.compute_model_diff()
-                await self.aggregator.receive_update(id(self), model_diff, performance)
+                await self.aggregator.receive_update(self.client_id, model_diff, performance)
                 
                 # Get latest global model
                 await self.sync_with_global_model()
@@ -487,13 +491,17 @@ class AsyncFederatedClient:
                 # Simulate varying update frequencies and network conditions
                 await asyncio.sleep(random.uniform(0.1, 1.0))
             except Exception as e:
-                print(f"Client {id(self)} encountered an error in round {round}: {str(e)}. Retrying...")
+                print(f"Client {self.client_id} encountered an error in round {round}: {str(e)}. Retrying...")
                 await asyncio.sleep(random.uniform(0.5, 2.0))
+            finally:
+                round_end_time = time.time()
+                self.total_time += round_end_time - round_start_time
 
-    async def train_locally(self, local_epochs):
+    async def train_locally(self, local_epochs, current_round, num_rounds):
         self.model.train()
         total_loss = 0
         for epoch in range(local_epochs):
+            epoch_loss = 0
             for inputs, labels in self.local_data:
                 inputs, labels = inputs.to(self.device), labels.to(self.device)
                 self.optimizer.zero_grad()
@@ -501,7 +509,11 @@ class AsyncFederatedClient:
                 loss = F.nll_loss(outputs, labels)
                 loss.backward()
                 self.optimizer.step()
-                total_loss += loss.item()
+                epoch_loss += loss.item()
+            
+            total_loss += epoch_loss
+            print(f"Client {self.client_id}: Round {current_round+1}/{num_rounds}, Epoch {epoch+1}/{local_epochs} completed. Loss: {epoch_loss:.4f}")
+        
         return total_loss / (len(self.local_data) * local_epochs)
 
     def compute_model_diff(self):
@@ -526,10 +538,23 @@ async def adaptive_async_federated_learning_simulation(num_clients, num_rounds, 
     
     global_model = MNISTNet().to(device)
     aggregator = AdaptiveAggregator(global_model)
-    clients = [AsyncFederatedClient(MNISTNet(), client_data, aggregator, device) for client_data in client_datasets]
+    clients = [AsyncFederatedClient(i, MNISTNet(), client_data, aggregator, device) for i, client_data in enumerate(client_datasets)]
     
     async def run_simulation():
         tasks = [asyncio.create_task(client.train_and_update(num_rounds, local_epochs)) for client in clients]
+        
+        # Fix: Update the total to num_rounds instead of num_rounds * num_clients
+        progress_bar = tqdm(total=num_rounds, desc="Adaptive Async Federated Learning")
+        
+        completed_rounds = 0
+        while not all(task.done() for task in tasks):
+            new_completed_rounds = min(task._coro.cr_frame.f_locals.get('round', 0) for task in tasks if not task.done())
+            if new_completed_rounds > completed_rounds:
+                progress_bar.update(new_completed_rounds - completed_rounds)
+                completed_rounds = new_completed_rounds
+            await asyncio.sleep(0.1)
+        
+        progress_bar.close()
         await asyncio.gather(*tasks)
 
     start_time = time.time()
@@ -539,7 +564,11 @@ async def adaptive_async_federated_learning_simulation(num_clients, num_rounds, 
     # Evaluate the final global model
     accuracy, f1, conf_matrix = evaluate_model(aggregator.global_model, test_loader, device)
     
-    results = (aggregator.global_model, accuracy, f1, conf_matrix, end_time - start_time)
+    # Calculate max path time and sum total time
+    max_path_time = max(client.total_time for client in clients)
+    sum_total_time = sum(client.total_time for client in clients)
+
+    results = (aggregator.global_model, accuracy, f1, conf_matrix, end_time - start_time, max_path_time, sum_total_time)
     save_cache(results, cache_file)
     return results
 
@@ -614,10 +643,9 @@ async def main():
         print(f"  Total Time: {cent_end_time - cent_start_time:.2f}s")
         print(f"  Actual Training Time: {cent_total_time:.2f}s")
 
-        # Add the new adaptive async federated learning simulation
         print("\nStarting Adaptive Async IID Federated Learning Simulation...")
         adaptive_async_fed_start_time = time.time()
-        adaptive_async_fed_model, adaptive_async_fed_accuracy, adaptive_async_fed_f1, adaptive_async_fed_conf_matrix, adaptive_async_fed_total_time = await adaptive_async_federated_learning_simulation(
+        adaptive_async_fed_model, adaptive_async_fed_accuracy, adaptive_async_fed_f1, adaptive_async_fed_conf_matrix, adaptive_async_fed_total_time, adaptive_async_fed_max_path_time, adaptive_async_fed_sum_total_time = await adaptive_async_federated_learning_simulation(
             num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=True
         )
         adaptive_async_fed_end_time = time.time()
@@ -627,7 +655,8 @@ async def main():
         print(f"  Accuracy: {adaptive_async_fed_accuracy:.4f}")
         print(f"  F1 Score: {adaptive_async_fed_f1:.4f}")
         print(f"  Total Time: {adaptive_async_fed_end_time - adaptive_async_fed_start_time:.2f}s")
-        print(f"  Actual Training Time: {adaptive_async_fed_total_time:.2f}s")
+        print(f"  Max Path Time: {adaptive_async_fed_max_path_time:.2f}s")
+        print(f"  Sum Total Time: {adaptive_async_fed_sum_total_time:.2f}s")
 
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
@@ -663,7 +692,8 @@ async def main():
             print("\nAdaptive Async IID Federated Learning:")
             print(f"  Accuracy: {adaptive_async_fed_accuracy:.4f}, F1: {adaptive_async_fed_f1:.4f}")
             print(f"  Total Time: {adaptive_async_fed_end_time - adaptive_async_fed_start_time:.2f}s")
-            print(f"  Actual Training Time: {adaptive_async_fed_total_time:.2f}s")
+            print(f"  Max Path Time: {adaptive_async_fed_max_path_time:.2f}s")
+            print(f"  Sum Total Time: {adaptive_async_fed_sum_total_time:.2f}s")
         else:
             print("Adaptive Async IID Federated Learning - Incomplete")
 
