@@ -20,9 +20,13 @@ from functools import partial
 import numpy as np
 import random
 from tqdm import tqdm
+import psutil
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
+
+# Add this constant at the top of the file
+CENTRALIZED_RESOURCE_FRACTION = 0.1
 
 @dataclass
 class PeerInfo:
@@ -155,10 +159,15 @@ class FederatedClient:
         self.data_manager = DataManager()
         self.local_data = local_data
         self.optimizer = optim.SGD(self.model_manager.model.parameters(), lr=0.01, momentum=0.9)
+        self.training_time = 0.0
+        self.network_delay = 0.0
 
     async def run_training_cycle(self, epochs: int = 1) -> Dict[str, torch.Tensor]:
+        start_time = time.time()
         data_loader = self.data_manager.get_data_loader(self.local_data)
         self.model_manager.train(data_loader, epochs, self.optimizer)
+        self.training_time = time.time() - start_time
+        self.network_delay = simulate_network_delay()
         return self.model_manager.get_parameters()
 
     def update_parameters(self, new_params: Dict[str, torch.Tensor]) -> None:
@@ -206,6 +215,7 @@ def run_client_training(model, local_data, optimizer, epochs, device, client_id)
     model.train()
     data_loader = DataManager.get_data_loader(local_data)
     for epoch in range(epochs):
+        epoch_start_time = time.time()
         for batch_idx, (inputs, labels) in enumerate(data_loader):
             inputs, labels = inputs.to(device), labels.to(device)
             optimizer.zero_grad()
@@ -214,9 +224,10 @@ def run_client_training(model, local_data, optimizer, epochs, device, client_id)
             loss.backward()
             optimizer.step()
         
-        # Print progress every epoch
-        if (epoch + 1) % 1 == 0:
-            print(f"Client {client_id}: Epoch {epoch+1}/{epochs} completed")
+        # Print progress every epoch with ongoing time
+        epoch_time = time.time() - epoch_start_time
+        total_time = time.time() - start_time
+        print(f"Client {client_id}: Epoch {epoch+1}/{epochs} completed. Epoch time: {epoch_time:.2f}s, Total time: {total_time:.2f}s")
     
     training_time = time.time() - start_time
     network_delay = simulate_network_delay()
@@ -249,6 +260,9 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
     early_stopping = EarlyStopping(patience=5)
     all_round_stats: List[RoundStats] = []
     
+    max_round_times = []
+    total_round_times = []
+
     for round in tqdm(range(num_rounds), desc="Federated Learning Rounds"):
         round_start_time = time.time()
         
@@ -261,6 +275,13 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
             )
         
         client_states, client_stats = zip(*results)
+        
+        # Calculate max and total round times
+        max_round_time = max(stat.training_time + stat.network_delay for stat in client_stats)
+        total_round_time = sum(stat.training_time + stat.network_delay for stat in client_stats)
+        
+        max_round_times.append(max_round_time)
+        total_round_times.append(total_round_time)
         
         # Aggregate models
         aggregated_state = AggregationManager.aggregate_models(client_states)
@@ -285,7 +306,7 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
             print("Early stopping triggered")
             break
     
-    results = (global_model, accuracy, f1, conf_matrix, all_round_stats)
+    results = (global_model, accuracy, f1, conf_matrix, all_round_stats, max_round_times, total_round_times)
     save_cache(results, cache_file)
     return results
 
@@ -300,7 +321,14 @@ async def centralized_learning_simulation(model, train_loader, test_loader, devi
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     early_stopping = EarlyStopping(patience=5)
     
+    # Limit CPU usage
+    process = psutil.Process()
+    cpu_count = psutil.cpu_count()
+    process.cpu_affinity([i for i in range(int(cpu_count * CENTRALIZED_RESOURCE_FRACTION))])
+
+    total_time = 0
     for epoch in tqdm(range(num_epochs), desc="Centralized Learning Epochs"):
+        epoch_start_time = time.time()
         model.train()
         for batch_idx, (data, target) in enumerate(train_loader):
             data, target = data.to(device), target.to(device)
@@ -312,12 +340,15 @@ async def centralized_learning_simulation(model, train_loader, test_loader, devi
         
         accuracy, f1, conf_matrix = evaluate_model(model, test_loader, device)
         
+        epoch_time = time.time() - epoch_start_time
+        total_time += epoch_time
+        
         early_stopping(1 - accuracy)  # Using accuracy as the metric to monitor
         if early_stopping.early_stop:
             print("Early stopping triggered")
             break
     
-    results = (model, accuracy, f1, conf_matrix)
+    results = (model, accuracy, f1, conf_matrix, total_time)
     save_cache(results, cache_file)
     return results
 
@@ -371,7 +402,7 @@ async def main():
     try:
         print("Starting Federated Learning Simulation...")
         fed_start_time = time.time()
-        fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats = await federated_learning_simulation(
+        fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats, max_round_times, total_round_times = await federated_learning_simulation(
             num_clients, num_rounds, local_epochs, full_dataset, test_loader, device
         )
         fed_end_time = time.time()
@@ -379,7 +410,7 @@ async def main():
         print("\nStarting Centralized Learning Simulation...")
         cent_model = MNISTNet().to(device)
         cent_start_time = time.time()
-        cent_model, cent_accuracy, cent_f1, cent_conf_matrix = await centralized_learning_simulation(
+        cent_model, cent_accuracy, cent_f1, cent_conf_matrix, cent_total_time = await centralized_learning_simulation(
             cent_model, train_loader, test_loader, device, num_epochs=5
         )
         cent_end_time = time.time()
@@ -389,12 +420,17 @@ async def main():
     finally:
         print("\nFinal Results:")
         if 'fed_accuracy' in locals():
-            print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}, Time: {fed_end_time - fed_start_time:.2f}s")
+            print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}")
+            print(f"  Total Time: {fed_end_time - fed_start_time:.2f}s")
+            print(f"  Max Path Time: {sum(max_round_times):.2f}s")
+            print(f"  Sum Total Time: {sum(total_round_times):.2f}s")
         else:
             print("Federated Learning - Incomplete")
         
         if 'cent_accuracy' in locals():
-            print(f"Centralized Learning - Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}, Time: {cent_end_time - cent_start_time:.2f}s")
+            print(f"Centralized Learning - Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}")
+            print(f"  Total Time: {cent_end_time - cent_start_time:.2f}s")
+            print(f"  Actual Training Time: {cent_total_time:.2f}s")
         else:
             print("Centralized Learning - Incomplete")
 
