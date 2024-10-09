@@ -1,6 +1,6 @@
 import asyncio
 import pickle
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Optional
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -24,6 +24,10 @@ import psutil
 from collections import deque
 import copy
 from tqdm import tqdm
+import aiohttp
+import aiohttp.web
+import json
+import zlib
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -34,10 +38,39 @@ CENTRALIZED_RESOURCE_FRACTION = 1.0 # just use full power supercomputer, but rem
 # e.g. 10 swarm computers vs 1 centralized computer is CENTRALIZED_RESOURCE_FRACTION = 0.1
 # 1.0 fraction means the central computer is as powerful as the whole swarm
 
+# At the top of your script, add:
+USE_REMOTE_ADDRESSES = False  # Set to True when using real remote instances
+REMOTE_ADDRESSES = [
+    ("192.168.1.100", 8000),
+    ("192.168.1.101", 8000),
+    ("192.168.1.102", 8000),
+    ("192.168.1.103", 8000),
+    ("192.168.1.104", 8000),
+    ("192.168.1.105", 8000),
+    ("192.168.1.106", 8000),
+    ("192.168.1.107", 8000),
+    ("192.168.1.108", 8000),
+    ("192.168.1.109", 8000)
+]
+
 @dataclass
 class PeerInfo:
     ip: str
     port: int
+    
+
+@dataclass
+class ClientStats:
+    client_id: int
+    training_time: float
+    network_delay: float
+
+@dataclass
+class RoundStats:
+    round_number: int
+    client_stats: List[ClientStats] = field(default_factory=list)
+    total_round_time: float = 0.0
+
 
 class MNISTNet(nn.Module):
     def __init__(self):
@@ -186,6 +219,134 @@ class FederatedClient:
     def update_parameters(self, new_params: Dict[str, torch.Tensor]) -> None:
         self.model_manager.update_parameters(new_params)
 
+import zlib
+import json
+
+class RealFederatedClient:
+    def __init__(self, client_id: int, model: nn.Module, local_data: torch.utils.data.Subset, 
+                 own_address: Tuple[str, int], peer_addresses: List[Tuple[str, int]]):
+        self.client_id = client_id
+        self.model_manager = ModelManager(model)
+        self.data_manager = DataManager()
+        self.local_data = local_data
+        self.optimizer = optim.SGD(self.model_manager.model.parameters(), lr=0.01, momentum=0.9)
+        self.own_address = own_address
+        self.peer_addresses = peer_addresses
+        self.training_time = 0.0
+        self.network_delay = 0.0
+
+    async def run_training_cycle(self, epochs: int = 1) -> Dict[str, torch.Tensor]:
+        start_time = time.time()
+        data_loader = self.data_manager.get_data_loader(self.local_data)
+        self.model_manager.train(data_loader, epochs, self.optimizer)
+        self.training_time = time.time() - start_time
+        return self.model_manager.get_parameters()
+
+    def update_parameters(self, new_params: Dict[str, torch.Tensor]) -> None:
+        self.model_manager.update_parameters(new_params)
+
+    async def send_model(self, peer_address: Tuple[str, int], model_data: Dict[str, torch.Tensor]) -> None:
+        url = f"http://{peer_address[0]}:{peer_address[1]}/update"
+        async with aiohttp.ClientSession() as session:
+            start_time = time.time()
+            serialized_data = {k: v.cpu().numpy().tolist() for k, v in model_data.items()}
+            compressed_data = zlib.compress(json.dumps(serialized_data).encode())
+            async with session.post(url, data=compressed_data, headers={'Content-Type': 'application/octet-stream'}) as response:
+                if response.status != 200:
+                    print(f"Error sending model to {peer_address}: {response.status}")
+            self.network_delay = time.time() - start_time
+
+    async def receive_model(self, request: aiohttp.web.Request) -> aiohttp.web.Response:
+        compressed_data = await request.read()
+        decompressed_data = zlib.decompress(compressed_data)
+        data = json.loads(decompressed_data.decode())
+        received_model = {k: torch.tensor(v) for k, v in data.items()}
+        self.update_parameters(received_model)
+        return aiohttp.web.Response(text="Model received")
+
+    async def start_server(self) -> None:
+        app = aiohttp.web.Application(client_max_size=1024**3)  # Set max payload size to 1GB
+        app.router.add_post('/update', self.receive_model)
+        runner = aiohttp.web.AppRunner(app)
+        await runner.setup()
+        site = aiohttp.web.TCPSite(runner, self.own_address[0], self.own_address[1])
+        await site.start()
+
+    async def federated_learning_round(self, round_num: int) -> None:
+        # Local training
+        local_model = await self.run_training_cycle()
+
+        # Send model to peers
+        for peer_address in self.peer_addresses:
+            await self.send_model(peer_address, local_model)
+
+        # Wait for a short time to receive updates from peers
+        await asyncio.sleep(5)
+
+        print(f"Client {self.client_id} completed round {round_num}")
+
+async def real_federated_learning_simulation(num_clients: int, num_rounds: int, local_epochs: int, 
+                                             train_dataset: torch.utils.data.Dataset, 
+                                             test_loader: torch.utils.data.DataLoader, 
+                                             device: torch.device, iid: bool = True) -> Tuple[nn.Module, float, float, np.ndarray, List[RoundStats], List[float], List[float]]:
+    if iid:
+        client_datasets = DataManager.get_iid_subsets(train_dataset, num_clients)
+    else:
+        client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
+
+    # Simulated IP addresses and ports
+    if USE_REMOTE_ADDRESSES:
+        # Replace these with actual remote addresses when using real instances
+        addresses = REMOTE_ADDRESSES
+    else:
+        base_port = 8000
+        addresses = [("localhost", base_port + i) for i in range(num_clients)]
+
+    clients = [
+        RealFederatedClient(
+            i, MNISTNet().to(device), client_data, 
+            addresses[i], [addr for addr in addresses if addr != addresses[i]]
+        )
+        for i, client_data in enumerate(client_datasets)
+    ]
+
+    # Start servers for all clients
+    await asyncio.gather(*[client.start_server() for client in clients])
+
+    all_round_stats: List[RoundStats] = []
+    max_round_times: List[float] = []
+    total_round_times: List[float] = []
+
+    for round in range(num_rounds):
+        round_start_time = time.time()
+        
+        # Run federated learning round for all clients
+        await asyncio.gather(*[client.federated_learning_round(round) for client in clients])
+
+        # Aggregate models (you may want to implement a more sophisticated aggregation strategy)
+        aggregated_model = AggregationManager.aggregate_models([client.model_manager.get_parameters() for client in clients])
+
+        # Update all clients with the aggregated model
+        for client in clients:
+            client.update_parameters(aggregated_model)
+
+        round_end_time = time.time()
+        round_time = round_end_time - round_start_time
+
+        # Calculate statistics
+        client_stats = [ClientStats(client.client_id, client.training_time, client.network_delay) for client in clients]
+        round_stats = RoundStats(round + 1, client_stats, round_time)
+        all_round_stats.append(round_stats)
+
+        max_round_times.append(max(client.training_time + client.network_delay for client in clients))
+        total_round_times.append(sum(client.training_time + client.network_delay for client in clients))
+
+    # Evaluate final model
+    final_model = clients[0].model_manager.model  # Use the first client's model as they should all be the same
+    accuracy, f1, conf_matrix = evaluate_model(final_model, test_loader, device)
+
+    return final_model, accuracy, f1, conf_matrix, all_round_stats, max_round_times, total_round_times
+
 def evaluate_model(model, data_loader, device):
     model.eval()
     correct = 0
@@ -207,18 +368,6 @@ def evaluate_model(model, data_loader, device):
     conf_matrix = confusion_matrix(all_targets, all_preds)
     
     return accuracy, f1, conf_matrix
-
-@dataclass
-class ClientStats:
-    client_id: int
-    training_time: float
-    network_delay: float
-
-@dataclass
-class RoundStats:
-    round_number: int
-    client_stats: List[ClientStats] = field(default_factory=list)
-    total_round_time: float = 0.0
 
 def simulate_network_delay():
     return random.uniform(0.1, 0.5)  # Simulated delay between 100ms and 500ms
@@ -258,12 +407,13 @@ def load_cache(filename):
             return pickle.load(f)
     return None
 
+
 async def federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device, iid=False):
-    cache_file = f'federated_cache_{"iid" if iid else "non_iid"}_{num_clients}_{num_rounds}_{local_epochs}.pkl'
+    cache_file = f'federated_cache_simulated_{"iid" if iid else "non_iid"}_{num_clients}_{num_rounds}_{local_epochs}.pkl'
     cached_data = load_cache(cache_file)
     
     if cached_data:
-        print(f"Loading {'IID' if iid else 'non-IID'} federated learning results from cache...")
+        print(f"Loading simulated {'IID' if iid else 'non-IID'} federated learning results from cache...")
         return cached_data
 
     if iid:
@@ -327,45 +477,71 @@ async def federated_learning_simulation(num_clients, num_rounds, local_epochs, t
     save_cache(results, cache_file)
     return results
 
-async def centralized_learning_simulation(model, train_loader, test_loader, device, num_epochs):
-    cache_file = f'centralized_cache_{num_epochs}.pkl'
+async def real_federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device, iid=True):
+    cache_file = f'federated_cache_real_{"iid" if iid else "non_iid"}_{num_clients}_{num_rounds}_{local_epochs}_{"remote" if USE_REMOTE_ADDRESSES else "localhost"}.pkl'
     cached_data = load_cache(cache_file)
     
     if cached_data:
-        print("Loading centralized learning results from cache...")
+        print(f"Loading real {'IID' if iid else 'non-IID'} federated learning results from cache ({'remote' if USE_REMOTE_ADDRESSES else 'localhost'})...")
         return cached_data
 
-    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
-    early_stopping = EarlyStopping(patience=5)
-    
-    # Limit CPU usage
-    process = psutil.Process()
-    cpu_count = psutil.cpu_count()
-    process.cpu_affinity([i for i in range(int(cpu_count * CENTRALIZED_RESOURCE_FRACTION))])
+    if iid:
+        client_datasets = DataManager.get_iid_subsets(train_dataset, num_clients)
+    else:
+        client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
 
-    total_time = 0
-    for epoch in tqdm(range(num_epochs), desc="Centralized Learning Epochs"):
-        epoch_start_time = time.time()
-        model.train()
-        for batch_idx, (data, target) in enumerate(train_loader):
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            output = model(data)
-            loss = F.nll_loss(output, target)
-            loss.backward()
-            optimizer.step()
+    # Use remote addresses if specified, otherwise use localhost
+    if USE_REMOTE_ADDRESSES:
+        addresses = REMOTE_ADDRESSES[:num_clients]
+    else:
+        base_port = 8000
+        addresses = [("localhost", base_port + i) for i in range(num_clients)]
+
+    global_model = MNISTNet().to(device)
+    clients = [
+        RealFederatedClient(
+            i, MNISTNet().to(device), client_data, 
+            addresses[i], [addr for addr in addresses if addr != addresses[i]]
+        )
+        for i, client_data in enumerate(client_datasets)
+    ]
+
+    # Start servers for all clients
+    await asyncio.gather(*[client.start_server() for client in clients])
+
+    all_round_stats = []
+    max_round_times = []
+    total_round_times = []
+
+    for round in range(num_rounds):
+        round_start_time = time.time()
         
-        accuracy, f1, conf_matrix = evaluate_model(model, test_loader, device)
-        
-        epoch_time = time.time() - epoch_start_time
-        total_time += epoch_time
-        
-        early_stopping(1 - accuracy)  # Using accuracy as the metric to monitor
-        if early_stopping.early_stop:
-            print("Early stopping triggered")
-            break
-    
-    results = (model, accuracy, f1, conf_matrix, total_time)
+        # Run federated learning round for all clients
+        await asyncio.gather(*[client.federated_learning_round(round) for client in clients])
+
+        # Aggregate models
+        aggregated_model = AggregationManager.aggregate_models([client.model_manager.get_parameters() for client in clients])
+
+        # Update all clients with the aggregated model
+        for client in clients:
+            client.update_parameters(aggregated_model)
+
+        round_end_time = time.time()
+        round_time = round_end_time - round_start_time
+
+        # Calculate statistics
+        client_stats = [ClientStats(client.client_id, client.training_time, client.network_delay) for client in clients]
+        round_stats = RoundStats(round + 1, client_stats, round_time)
+        all_round_stats.append(round_stats)
+
+        max_round_times.append(max(client.training_time + client.network_delay for client in clients))
+        total_round_times.append(sum(client.training_time + client.network_delay for client in clients))
+
+    # Evaluate final model
+    global_model.load_state_dict(aggregated_model)
+    accuracy, f1, conf_matrix = evaluate_model(global_model, test_loader, device)
+
+    results = (global_model, accuracy, f1, conf_matrix, all_round_stats, max_round_times, total_round_times)
     save_cache(results, cache_file)
     return results
 
@@ -597,12 +773,20 @@ async def main():
     # Centralized Learning parameters
     centralized_epochs = TOTAL_EPOCHS
     
+    # Add a flag to choose between simulated and real federated learning
+    use_real_federated = True  # Set this to True to use real federated learning
+
     try:
         print("Starting Non-IID Federated Learning Simulation...")
         fed_start_time = time.time()
-        fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats, max_round_times, total_round_times = await federated_learning_simulation(
-            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=False
-        )
+        if use_real_federated:
+            fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats, max_round_times, total_round_times = await real_federated_learning_simulation(
+                num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=False
+            )
+        else:
+            fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats, max_round_times, total_round_times = await federated_learning_simulation(
+                num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=False
+            )
         fed_end_time = time.time()
         
         # Add performance summary for Non-IID Federated Learning
