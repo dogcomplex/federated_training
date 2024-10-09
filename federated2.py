@@ -27,6 +27,9 @@ logger = logging.getLogger(__name__)
 
 # Add this constant at the top of the file
 CENTRALIZED_RESOURCE_FRACTION = 0.1
+# set this to the ratio of how strong the centralized learning computer should be vs the federated swarm
+# e.g. 10 swarm computers vs 1 centralized computer is CENTRALIZED_RESOURCE_FRACTION = 0.1
+# 1.0 fraction means the central computer is as powerful as the whole swarm
 
 @dataclass
 class PeerInfo:
@@ -406,9 +409,16 @@ async def main():
     train_loader = torch.utils.data.DataLoader(full_dataset, batch_size=64, shuffle=True)
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1000, shuffle=False)
     
+    # Set the total number of passes over the dataset
+    TOTAL_PASSES = 10
+    
+    # Federated Learning parameters
     num_clients = 10
     num_rounds = 5
-    local_epochs = 5
+    local_epochs = TOTAL_PASSES // num_rounds
+    
+    # Centralized Learning parameters
+    centralized_epochs = TOTAL_PASSES
     
     try:
         print("Starting Non-IID Federated Learning Simulation...")
@@ -429,7 +439,7 @@ async def main():
         cent_model = MNISTNet().to(device)
         cent_start_time = time.time()
         cent_model, cent_accuracy, cent_f1, cent_conf_matrix, cent_total_time = await centralized_learning_simulation(
-            cent_model, train_loader, test_loader, device, num_epochs=5
+            cent_model, train_loader, test_loader, device, num_epochs=centralized_epochs
         )
         cent_end_time = time.time()
 
