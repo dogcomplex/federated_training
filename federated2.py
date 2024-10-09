@@ -427,6 +427,14 @@ async def main():
             num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=False
         )
         fed_end_time = time.time()
+        
+        # Add performance summary for Non-IID Federated Learning
+        print("\nNon-IID Federated Learning Performance Summary:")
+        print(f"  Accuracy: {fed_accuracy:.4f}")
+        print(f"  F1 Score: {fed_f1:.4f}")
+        print(f"  Total Time: {fed_end_time - fed_start_time:.2f}s")
+        print(f"  Max Path Time: {sum(max_round_times):.2f}s")
+        print(f"  Sum Total Time: {sum(total_round_times):.2f}s")
 
         print("\nStarting IID Federated Learning Simulation...")
         iid_fed_start_time = time.time()
@@ -434,6 +442,14 @@ async def main():
             num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=True
         )
         iid_fed_end_time = time.time()
+        
+        # Add performance summary for IID Federated Learning
+        print("\nIID Federated Learning Performance Summary:")
+        print(f"  Accuracy: {iid_fed_accuracy:.4f}")
+        print(f"  F1 Score: {iid_fed_f1:.4f}")
+        print(f"  Total Time: {iid_fed_end_time - iid_fed_start_time:.2f}s")
+        print(f"  Max Path Time: {sum(iid_max_round_times):.2f}s")
+        print(f"  Sum Total Time: {sum(iid_total_round_times):.2f}s")
 
         print("\nStarting Centralized Learning Simulation...")
         cent_model = MNISTNet().to(device)
@@ -442,6 +458,13 @@ async def main():
             cent_model, train_loader, test_loader, device, num_epochs=centralized_epochs
         )
         cent_end_time = time.time()
+        
+        # Add performance summary for Centralized Learning
+        print("\nCentralized Learning Performance Summary:")
+        print(f"  Accuracy: {cent_accuracy:.4f}")
+        print(f"  F1 Score: {cent_f1:.4f}")
+        print(f"  Total Time: {cent_end_time - cent_start_time:.2f}s")
+        print(f"  Actual Training Time: {cent_total_time:.2f}s")
 
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
