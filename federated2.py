@@ -410,15 +410,15 @@ async def main():
     test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1000, shuffle=False)
     
     # Set the total number of passes over the dataset
-    TOTAL_PASSES = 10
+    TOTAL_EPOCHS = 10
     
     # Federated Learning parameters
     num_clients = 10
-    num_rounds = 5
-    local_epochs = TOTAL_PASSES // num_rounds
+    local_epochs = 2 # epochs per client
+    num_rounds = TOTAL_EPOCHS // local_epochs
     
     # Centralized Learning parameters
-    centralized_epochs = TOTAL_PASSES
+    centralized_epochs = TOTAL_EPOCHS
     
     try:
         print("Starting Non-IID Federated Learning Simulation...")
