@@ -4,16 +4,21 @@ from typing import List, Dict, Any, Tuple
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import ssl
 import signal
 import torch.nn.functional as F
-from sklearn.metrics import accuracy_score
+from sklearn.metrics import accuracy_score, f1_score, confusion_matrix
 from torchvision import datasets, transforms
 from contextlib import asynccontextmanager
 import json
 import os
+import time
+import multiprocessing
+from functools import partial
+import numpy as np
+import random
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -23,13 +28,48 @@ class PeerInfo:
     ip: str
     port: int
 
-class NeuralNet(nn.Module):
+class MNISTNet(nn.Module):
     def __init__(self):
-        super(NeuralNet, self).__init__()
-        self.layer = nn.Linear(10, 2)
+        super(MNISTNet, self).__init__()
+        self.conv1 = nn.Conv2d(1, 32, 3, 1)
+        self.conv2 = nn.Conv2d(32, 64, 3, 1)
+        self.dropout1 = nn.Dropout(0.25)  # Changed from Dropout2d to Dropout
+        self.dropout2 = nn.Dropout(0.5)   # Changed from Dropout2d to Dropout
+        self.fc1 = nn.Linear(9216, 128)
+        self.fc2 = nn.Linear(128, 10)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer(x)
+    def forward(self, x):
+        x = self.conv1(x)
+        x = F.relu(x)
+        x = self.conv2(x)
+        x = F.relu(x)
+        x = F.max_pool2d(x, 2)
+        x = self.dropout1(x)
+        x = torch.flatten(x, 1)
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = self.dropout2(x)
+        x = self.fc2(x)
+        return F.log_softmax(x, dim=1)
+
+class EarlyStopping:
+    def __init__(self, patience=5, min_delta=0):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.counter = 0
+        self.best_loss = None
+        self.early_stop = False
+
+    def __call__(self, val_loss):
+        if self.best_loss is None:
+            self.best_loss = val_loss
+        elif val_loss > self.best_loss - self.min_delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_loss = val_loss
+            self.counter = 0
 
 class ModelManager:
     def __init__(self, model: nn.Module):
@@ -37,9 +77,10 @@ class ModelManager:
         self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
         self.model.to(self.device)
 
-    def train(self, data_loader: torch.utils.data.DataLoader, epochs: int = 1) -> None:
+    def train(self, data_loader: torch.utils.data.DataLoader, epochs: int = 1, optimizer: optim.Optimizer = None) -> None:
         self.model.train()
-        optimizer = optim.SGD(self.model.parameters(), lr=0.01)
+        if optimizer is None:
+            optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
         criterion = nn.CrossEntropyLoss()
 
         for epoch in range(epochs):
@@ -62,6 +103,18 @@ class DataManager:
     @staticmethod
     def get_data_loader(data: torch.utils.data.Subset) -> torch.utils.data.DataLoader:
         return torch.utils.data.DataLoader(data, batch_size=32, shuffle=True)
+
+    @staticmethod
+    def get_label_based_subsets(dataset, num_clients):
+        labels = dataset.targets.numpy()
+        label_indices = [np.where(labels == i)[0] for i in range(10)]
+        client_subsets = [[] for _ in range(num_clients)]
+        for label_idx in label_indices:
+            np.random.shuffle(label_idx)
+            split_indices = np.array_split(label_idx, num_clients)
+            for i, split in enumerate(split_indices):
+                client_subsets[i].extend(split)
+        return [torch.utils.data.Subset(dataset, indices) for indices in client_subsets]
 
 class CommunicationManager:
     def __init__(self):
@@ -100,135 +153,155 @@ class FederatedClient:
         self.model_manager = ModelManager(model)
         self.data_manager = DataManager()
         self.local_data = local_data
+        self.optimizer = optim.SGD(self.model_manager.model.parameters(), lr=0.01, momentum=0.9)
 
     async def run_training_cycle(self, epochs: int = 1) -> Dict[str, torch.Tensor]:
         data_loader = self.data_manager.get_data_loader(self.local_data)
-        self.model_manager.train(data_loader, epochs)
+        self.model_manager.train(data_loader, epochs, self.optimizer)
         return self.model_manager.get_parameters()
 
     def update_parameters(self, new_params: Dict[str, torch.Tensor]) -> None:
         self.model_manager.update_parameters(new_params)
 
-class MNISTNet(nn.Module):
-    def __init__(self):
-        super(MNISTNet, self).__init__()
-        self.conv1 = nn.Conv2d(1, 32, 3, 1)
-        self.conv2 = nn.Conv2d(32, 64, 3, 1)
-        self.dropout1 = nn.Dropout2d(0.25)
-        self.dropout2 = nn.Dropout2d(0.5)
-        self.fc1 = nn.Linear(9216, 128)
-        self.fc2 = nn.Linear(128, 10)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu(x)
-        x = self.conv2(x)
-        x = F.relu(x)
-        x = F.max_pool2d(x, 2)
-        x = self.dropout1(x)
-        x = torch.flatten(x, 1)
-        x = self.fc1(x)
-        x = F.relu(x)
-        x = self.dropout2(x)
-        x = self.fc2(x)
-        return F.log_softmax(x, dim=1)
-
-async def test_federated_learning_simulation():
-    print("Starting federated learning simulation setup...")
-    num_clients = 3
-    num_rounds = 5
-    batch_size = 64
-    test_batch_size = 1000
-
-    # Load MNIST dataset
-    transform = transforms.Compose([
-        transforms.ToTensor(),
-        transforms.Normalize((0.1307,), (0.3081,))
-    ])
+def evaluate_model(model, data_loader, device):
+    model.eval()
+    correct = 0
+    total = 0
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for data, target in data_loader:
+            data, target = data.to(device), target.to(device)
+            output = model(data)
+            _, predicted = torch.max(output.data, 1)
+            total += target.size(0)
+            correct += (predicted == target).sum().item()
+            all_preds.extend(predicted.cpu().numpy())
+            all_targets.extend(target.cpu().numpy())
     
-    full_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
-    test_dataset = datasets.MNIST('../data', train=False, transform=transform)
+    accuracy = correct / total
+    f1 = f1_score(all_targets, all_preds, average='weighted')
+    conf_matrix = confusion_matrix(all_targets, all_preds)
     
-    # Split dataset for federated learning
-    client_dataset_size = len(full_dataset) // num_clients
-    client_datasets = torch.utils.data.random_split(full_dataset, [client_dataset_size] * num_clients)
+    return accuracy, f1, conf_matrix
 
-    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=test_batch_size)
+@dataclass
+class ClientStats:
+    client_id: int
+    training_time: float
+    network_delay: float
 
-    # Function to evaluate model
-    def evaluate_model(model, data_loader):
-        model.eval()
-        correct = 0
-        with torch.no_grad():
-            for data, target in data_loader:
-                output = model(data)
-                pred = output.argmax(dim=1, keepdim=True)
-                correct += pred.eq(target.view_as(pred)).sum().item()
-        accuracy = correct / len(data_loader.dataset)
-        return accuracy
+@dataclass
+class RoundStats:
+    round_number: int
+    client_stats: List[ClientStats] = field(default_factory=list)
+    total_round_time: float = 0.0
 
-    # Check for cached centralized results
-    cache_file = 'centralized_results.json'
-    if os.path.exists(cache_file):
-        with open(cache_file, 'r') as f:
-            cached_results = json.load(f)
-        print(f"Using cached centralized results: {cached_results}")
-        centralized_accuracy = cached_results['final_accuracy']
-    else:
-        # Centralized training
-        logger.info("Starting centralized training...")
-        centralized_model = MNISTNet()
-        centralized_loader = torch.utils.data.DataLoader(full_dataset, batch_size=batch_size, shuffle=True)
-        centralized_model_manager = ModelManager(centralized_model)
+def simulate_network_delay():
+    return random.uniform(0.1, 0.5)  # Simulated delay between 100ms and 500ms
+
+def run_client_training(model, local_data, optimizer, epochs, device, client_id):
+    start_time = time.time()
+    model.train()
+    data_loader = DataManager.get_data_loader(local_data)
+    for epoch in range(epochs):
+        for batch_idx, (inputs, labels) in enumerate(data_loader):
+            inputs, labels = inputs.to(device), labels.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = F.nll_loss(outputs, labels)
+            loss.backward()
+            optimizer.step()
         
-        for round in range(num_rounds):
-            centralized_model_manager.train(centralized_loader, epochs=1)
-            accuracy = evaluate_model(centralized_model, test_loader)
-            logger.info(f"Centralized Round {round + 1}/{num_rounds} - Accuracy: {accuracy:.4f}")
-        
-        centralized_accuracy = evaluate_model(centralized_model, test_loader)
-        logger.info(f"Final Centralized Accuracy: {centralized_accuracy:.4f}")
+        # Print progress every epoch
+        if (epoch + 1) % 1 == 0:
+            print(f"Client {client_id}: Epoch {epoch+1}/{epochs} completed")
+    
+    training_time = time.time() - start_time
+    network_delay = simulate_network_delay()
+    print(f"Client {client_id}: Training time: {training_time:.2f}s, Network delay: {network_delay:.2f}s")
+    
+    return model.state_dict(), ClientStats(client_id, training_time, network_delay)
 
-        # Cache the results
-        with open(cache_file, 'w') as f:
-            json.dump({
-                'num_rounds': num_rounds,
-                'batch_size': batch_size,
-                'final_accuracy': centralized_accuracy
-            }, f)
-
-    # Federated learning simulation
-    print("Starting federated learning simulation...")
-    async def simulate_client(client_id):
-        print(f"Simulating client {client_id}...")
-        model = MNISTNet()
-        client = FederatedClient(
-            model=model,
-            local_data=client_datasets[client_id]
-        )
-        return await client.run_training_cycle(epochs=1)
-
-    federated_model = MNISTNet()
-    global_parameters = federated_model.state_dict()
-
+async def federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device):
+    client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
+    global_model = MNISTNet().to(device)
+    clients = [FederatedClient(MNISTNet().to(device), client_data) for client_data in client_datasets]
+    
+    early_stopping = EarlyStopping(patience=5)
+    all_round_stats: List[RoundStats] = []
+    
     for round in range(num_rounds):
-        print(f"Federated Round {round + 1}/{num_rounds}")
-        client_tasks = [simulate_client(i) for i in range(num_clients)]
-        client_parameters = await asyncio.gather(*client_tasks)
-
-        print("Aggregating client models...")
-        aggregated_params = AggregationManager.aggregate_models(client_parameters)
-        federated_model.load_state_dict(aggregated_params)
-        global_parameters = aggregated_params
-
-        # Evaluate federated model on test data
-        federated_accuracy = evaluate_model(federated_model, test_loader)
+        round_start_time = time.time()
+        print(f"\nStarting Federated Learning Round {round+1}/{num_rounds}")
         
-        print(f"Federated Round {round + 1}/{num_rounds} - Accuracy: {federated_accuracy:.4f}")
+        # Simulate parallel training
+        with multiprocessing.Pool(processes=num_clients) as pool:
+            results = pool.starmap(
+                run_client_training,
+                [(client.model_manager.model, client.local_data, client.optimizer, local_epochs, device, client_id) 
+                 for client_id, client in enumerate(clients)]
+            )
+        
+        client_states, client_stats = zip(*results)
+        
+        # Aggregate models
+        aggregated_state = AggregationManager.aggregate_models(client_states)
+        global_model.load_state_dict(aggregated_state)
+        
+        # Update client models with the aggregated global model
+        for client in clients:
+            client.update_parameters(aggregated_state)
+        
+        # Evaluate global model
+        accuracy, f1, conf_matrix = evaluate_model(global_model, test_loader, device)
+        
+        round_end_time = time.time()
+        round_time = round_end_time - round_start_time
+        print(f"Round {round+1}/{num_rounds} completed")
+        print(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Total Round Time: {round_time:.2f}s")
+        
+        # Store round statistics
+        round_stats = RoundStats(round + 1, list(client_stats), round_time)
+        all_round_stats.append(round_stats)
+        
+        early_stopping(1 - accuracy)  # Using accuracy as the metric to monitor
+        if early_stopping.early_stop:
+            print("Early stopping triggered")
+            break
+    
+    return global_model, accuracy, f1, conf_matrix, all_round_stats
 
-    print(f"Final Centralized Accuracy: {centralized_accuracy:.4f}")
-    print(f"Final Federated Accuracy: {federated_accuracy:.4f}")
-    print("Federated learning simulation completed.")
+async def centralized_learning_simulation(model, train_loader, test_loader, device, num_epochs):
+    optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+    early_stopping = EarlyStopping(patience=5)
+    
+    print("\nStarting Centralized Learning")
+    
+    for epoch in range(num_epochs):
+        start_time = time.time()
+        
+        model.train()
+        for batch_idx, (data, target) in enumerate(train_loader):
+            data, target = data.to(device), target.to(device)
+            optimizer.zero_grad()
+            output = model(data)
+            loss = F.nll_loss(output, target)
+            loss.backward()
+            optimizer.step()
+        
+        accuracy, f1, conf_matrix = evaluate_model(model, test_loader, device)
+        
+        end_time = time.time()
+        print(f"Epoch {epoch+1}/{num_epochs} completed")
+        print(f"Accuracy: {accuracy:.4f}, F1: {f1:.4f}, Time: {end_time - start_time:.2f}s")
+        
+        early_stopping(1 - accuracy)  # Using accuracy as the metric to monitor
+        if early_stopping.early_stop:
+            print("Early stopping triggered")
+            break
+    
+    return model, accuracy, f1, conf_matrix
 
 @asynccontextmanager
 async def graceful_shutdown(client):
@@ -260,29 +333,62 @@ async def run_with_graceful_shutdown(client):
                 pass
 
 async def main():
-    local_address = '0.0.0.0'
-    local_port = 8000
-    peers = [
-        PeerInfo(ip='192.168.1.2', port=8000),
-        PeerInfo(ip='192.168.1.3', port=8000),
-    ]
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    
+    full_dataset = datasets.MNIST('../data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('../data', train=False, transform=transform)
+    
+    train_loader = torch.utils.data.DataLoader(full_dataset, batch_size=64, shuffle=True)
+    test_loader = torch.utils.data.DataLoader(test_dataset, batch_size=1000, shuffle=False)
+    
+    num_clients = 10
+    num_rounds = 5
+    local_epochs = 5
+    
+    try:
+        print("Starting Federated Learning Simulation...")
+        fed_start_time = time.time()
+        fed_model, fed_accuracy, fed_f1, fed_conf_matrix, round_stats = await federated_learning_simulation(
+            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device
+        )
+        fed_end_time = time.time()
 
-    model = NeuralNet()
-    local_data = {
-        'inputs': torch.randn(1000, 10),
-        'labels': torch.randint(0, 2, (1000,))
-    }
+        print("\nStarting Centralized Learning Simulation...")
+        cent_model = MNISTNet().to(device)
+        cent_start_time = time.time()
+        cent_model, cent_accuracy, cent_f1, cent_conf_matrix = await centralized_learning_simulation(
+            cent_model, train_loader, test_loader, device, num_epochs=50
+        )
+        cent_end_time = time.time()
 
-    client = FederatedClient(
-        model=model,
-        local_data=local_data,
-        peers=peers,
-        local_address=local_address,
-        local_port=local_port
-    )
+        print("\nFinal Results:")
+        print(f"Federated Learning - Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}, Time: {fed_end_time - fed_start_time:.2f}s")
+        if 'cent_accuracy' in locals():
+            print(f"Centralized Learning - Accuracy: {cent_accuracy:.4f}, F1: {cent_f1:.4f}, Time: {cent_end_time - cent_start_time:.2f}s")
+        else:
+            print("Centralized Learning - Incomplete")
 
-    await run_with_graceful_shutdown(client)
+        print("\nConfusion Matrices:")
+        print("Federated Learning:")
+        print(f"{fed_conf_matrix}")
+        print("Centralized Learning:")
+        print(f"{cent_conf_matrix}")
+        
+        print("\nRound Statistics:")
+        for round_stat in round_stats:
+            print(f"Round {round_stat.round_number}:")
+            print(f"  Total Round Time: {round_stat.total_round_time:.2f}s")
+            for client_stat in round_stat.client_stats:
+                print(f"  Client {client_stat.client_id}: Training Time: {client_stat.training_time:.2f}s, Network Delay: {client_stat.network_delay:.2f}s")
+            print()
+
+    except KeyboardInterrupt:
+        print("\nSimulation interrupted by user.")
 
 if __name__ == '__main__':
-    print("Starting the federated learning simulation...")
-    asyncio.run(test_federated_learning_simulation())
+    asyncio.run(main())
