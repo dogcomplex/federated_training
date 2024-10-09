@@ -21,12 +21,14 @@ import numpy as np
 import random
 from tqdm import tqdm
 import psutil
+from collections import deque
+import copy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Add this constant at the top of the file
-CENTRALIZED_RESOURCE_FRACTION = 0.1
+CENTRALIZED_RESOURCE_FRACTION = 1.0 # just use full power supercomputer, but remember this when comparing lol
 # set this to the ratio of how strong the centralized learning computer should be vs the federated swarm
 # e.g. 10 swarm computers vs 1 centralized computer is CENTRALIZED_RESOURCE_FRACTION = 0.1
 # 1.0 fraction means the central computer is as powerful as the whole swarm
@@ -395,6 +397,152 @@ async def run_with_graceful_shutdown(client):
             except asyncio.CancelledError:
                 pass
 
+class AdaptiveAggregator:
+    def __init__(self, initial_model, update_threshold=10, adaptation_interval=5):
+        self.global_model = initial_model
+        self.pending_updates = deque()
+        self.update_threshold = update_threshold
+        self.version = 0
+        self.adaptation_interval = adaptation_interval
+        self.performance_history = []
+        self.best_model = copy.deepcopy(initial_model)
+        self.best_performance = float('inf')
+
+    async def receive_update(self, client_id, model_update, client_performance):
+        await self.simulate_network_conditions()
+        self.pending_updates.append((client_id, model_update, client_performance))
+        if len(self.pending_updates) >= self.update_threshold:
+            await self.aggregate_updates()
+
+    async def simulate_network_conditions(self):
+        # Simulate network latency
+        await asyncio.sleep(random.uniform(0.1, 2.0))
+        
+        # Simulate network unreliability (5% chance of failure)
+        if random.random() < 0.05:
+            raise Exception("Network failure simulated")
+
+    async def aggregate_updates(self):
+        updates_to_aggregate = list(self.pending_updates)
+        self.pending_updates.clear()
+        
+        # FedAvg-style aggregation
+        total_samples = sum(len(update[1]) for update in updates_to_aggregate)
+        aggregated_update = {}
+        for param_name in self.global_model.state_dict():
+            weighted_update = sum(update[1][param_name] * len(update[1]) for update in updates_to_aggregate)
+            aggregated_update[param_name] = weighted_update / total_samples
+
+        # Apply the aggregated update to the global model
+        self.global_model.load_state_dict({name: self.global_model.state_dict()[name] + aggregated_update[name] 
+                                           for name in self.global_model.state_dict()})
+        
+        self.version += 1
+        
+        # Record performance
+        avg_performance = sum(perf for _, _, perf in updates_to_aggregate) / len(updates_to_aggregate)
+        self.performance_history.append(avg_performance)
+        
+        # Adapt the update threshold
+        if len(self.performance_history) >= self.adaptation_interval:
+            self.adapt_threshold()
+
+        # Check if this is the best model so far
+        if avg_performance < self.best_performance:
+            self.best_performance = avg_performance
+            self.best_model = copy.deepcopy(self.global_model)
+
+    def adapt_threshold(self):
+        recent_performance = self.performance_history[-self.adaptation_interval:]
+        if all(perf >= recent_performance[0] for perf in recent_performance):
+            # Performance is consistently improving or stable, increase threshold
+            self.update_threshold = min(self.update_threshold + 1, 20)
+        else:
+            # Performance is fluctuating or decreasing, decrease threshold
+            self.update_threshold = max(self.update_threshold - 1, 5)
+        
+        self.performance_history = self.performance_history[-self.adaptation_interval:]
+
+class AsyncFederatedClient:
+    def __init__(self, model, local_data, aggregator, device):
+        self.model = model.to(device)
+        self.local_data = DataManager.get_data_loader(local_data)
+        self.aggregator = aggregator
+        self.device = device
+        self.optimizer = optim.SGD(self.model.parameters(), lr=0.01, momentum=0.9)
+
+    async def train_and_update(self, num_rounds, local_epochs):
+        for round in range(num_rounds):
+            try:
+                # Local training
+                performance = await self.train_locally(local_epochs)
+                
+                # Send update to aggregator
+                model_diff = self.compute_model_diff()
+                await self.aggregator.receive_update(id(self), model_diff, performance)
+                
+                # Get latest global model
+                await self.sync_with_global_model()
+                
+                # Simulate varying update frequencies and network conditions
+                await asyncio.sleep(random.uniform(0.1, 1.0))
+            except Exception as e:
+                print(f"Client {id(self)} encountered an error in round {round}: {str(e)}. Retrying...")
+                await asyncio.sleep(random.uniform(0.5, 2.0))
+
+    async def train_locally(self, local_epochs):
+        self.model.train()
+        total_loss = 0
+        for epoch in range(local_epochs):
+            for inputs, labels in self.local_data:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                self.optimizer.zero_grad()
+                outputs = self.model(inputs)
+                loss = F.nll_loss(outputs, labels)
+                loss.backward()
+                self.optimizer.step()
+                total_loss += loss.item()
+        return total_loss / (len(self.local_data) * local_epochs)
+
+    def compute_model_diff(self):
+        return {name: param.data.clone() - self.aggregator.global_model.state_dict()[name].data.clone()
+                for name, param in self.model.named_parameters()}
+
+    async def sync_with_global_model(self):
+        self.model.load_state_dict(self.aggregator.global_model.state_dict())
+
+async def adaptive_async_federated_learning_simulation(num_clients, num_rounds, local_epochs, train_dataset, test_loader, device, iid=True):
+    cache_file = f'adaptive_async_federated_cache_{"iid" if iid else "non_iid"}_{num_clients}_{num_rounds}_{local_epochs}.pkl'
+    cached_data = load_cache(cache_file)
+    
+    if cached_data:
+        print(f"Loading Adaptive Async {'IID' if iid else 'non-IID'} federated learning results from cache...")
+        return cached_data
+
+    if iid:
+        client_datasets = DataManager.get_iid_subsets(train_dataset, num_clients)
+    else:
+        client_datasets = DataManager.get_label_based_subsets(train_dataset, num_clients)
+    
+    global_model = MNISTNet().to(device)
+    aggregator = AdaptiveAggregator(global_model)
+    clients = [AsyncFederatedClient(MNISTNet(), client_data, aggregator, device) for client_data in client_datasets]
+    
+    async def run_simulation():
+        tasks = [asyncio.create_task(client.train_and_update(num_rounds, local_epochs)) for client in clients]
+        await asyncio.gather(*tasks)
+
+    start_time = time.time()
+    await run_simulation()
+    end_time = time.time()
+
+    # Evaluate the final global model
+    accuracy, f1, conf_matrix = evaluate_model(aggregator.global_model, test_loader, device)
+    
+    results = (aggregator.global_model, accuracy, f1, conf_matrix, end_time - start_time)
+    save_cache(results, cache_file)
+    return results
+
 async def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
@@ -466,10 +614,25 @@ async def main():
         print(f"  Total Time: {cent_end_time - cent_start_time:.2f}s")
         print(f"  Actual Training Time: {cent_total_time:.2f}s")
 
+        # Add the new adaptive async federated learning simulation
+        print("\nStarting Adaptive Async IID Federated Learning Simulation...")
+        adaptive_async_fed_start_time = time.time()
+        adaptive_async_fed_model, adaptive_async_fed_accuracy, adaptive_async_fed_f1, adaptive_async_fed_conf_matrix, adaptive_async_fed_total_time = await adaptive_async_federated_learning_simulation(
+            num_clients, num_rounds, local_epochs, full_dataset, test_loader, device, iid=True
+        )
+        adaptive_async_fed_end_time = time.time()
+
+        # Add performance summary for Adaptive Async Federated Learning
+        print("\nAdaptive Async IID Federated Learning Performance Summary:")
+        print(f"  Accuracy: {adaptive_async_fed_accuracy:.4f}")
+        print(f"  F1 Score: {adaptive_async_fed_f1:.4f}")
+        print(f"  Total Time: {adaptive_async_fed_end_time - adaptive_async_fed_start_time:.2f}s")
+        print(f"  Actual Training Time: {adaptive_async_fed_total_time:.2f}s")
+
     except KeyboardInterrupt:
         print("\nSimulation interrupted by user.")
     finally:
-        print("\nFinal Results:")
+        print("\n============ Final Results:  =============================")
         if 'fed_accuracy' in locals():
             print("Non-IID Federated Learning:")
             print(f"  Accuracy: {fed_accuracy:.4f}, F1: {fed_f1:.4f}")
@@ -496,7 +659,15 @@ async def main():
         else:
             print("Centralized Learning - Incomplete")
 
-        if 'fed_conf_matrix' in locals() and 'iid_fed_conf_matrix' in locals() and 'cent_conf_matrix' in locals():
+        if 'adaptive_async_fed_accuracy' in locals():
+            print("\nAdaptive Async IID Federated Learning:")
+            print(f"  Accuracy: {adaptive_async_fed_accuracy:.4f}, F1: {adaptive_async_fed_f1:.4f}")
+            print(f"  Total Time: {adaptive_async_fed_end_time - adaptive_async_fed_start_time:.2f}s")
+            print(f"  Actual Training Time: {adaptive_async_fed_total_time:.2f}s")
+        else:
+            print("Adaptive Async IID Federated Learning - Incomplete")
+
+        if 'fed_conf_matrix' in locals() and 'iid_fed_conf_matrix' in locals() and 'cent_conf_matrix' in locals() and 'adaptive_async_fed_conf_matrix' in locals():
             print("\nConfusion Matrices:")
             print("Non-IID Federated Learning:")
             print(fed_conf_matrix)
@@ -504,6 +675,8 @@ async def main():
             print(iid_fed_conf_matrix)
             print("\nCentralized Learning:")
             print(cent_conf_matrix)
+            print("\nAdaptive Async IID Federated Learning:")
+            print(adaptive_async_fed_conf_matrix)
 
         if 'round_stats' in locals():
             print("\nRound Statistics:")
